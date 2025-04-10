@@ -16,7 +16,7 @@ import torch
 from prepare_data import load_and_prepare_data, format_prompt
 
 def prepare_model():
-    access_token = "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"
+    access_token = None
     # Load model and tokenizer
     model_name = "meta-llama/Meta-Llama-3-8B-Instruct"  # replace with actual model name
 
