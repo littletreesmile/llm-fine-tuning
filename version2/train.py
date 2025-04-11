@@ -13,7 +13,8 @@ from transformers import (
     DataCollatorForLanguageModeling,
     DataCollatorWithPadding,
     BitsAndBytesConfig,
-    get_scheduler
+    get_scheduler,
+    BatchEncoding
 )
 import evaluate
 from peft import LoraConfig, get_peft_model
@@ -23,10 +24,11 @@ from torch.utils.data import DataLoader
 from prepare_data import load_and_prepare_data, format_prompt
 
 
+
 def prepare_model():
-    access_token = "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"
+    access_token = None
     # Load model and tokenizer
-    model_name = "meta-llama/Meta-Llama-3-8B-Instruct"  # replace with actual model name
+    model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,  # quantize in 4-bit
@@ -43,8 +45,9 @@ def prepare_model():
         token=access_token
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name, token=access_token)
-    tokenizer.add_special_tokens({"pad_token": "<pad>"})
-    model.resize_token_embeddings(len(tokenizer))
+    tokenizer.pad_token = tokenizer.eos_token  # Use EOS as pad token
+    tokenizer.padding_side = "right"  # Important for causal LM
+    # model.resize_token_embeddings(len(tokenizer))
 
     # Configure LoRA
     lora_config = LoraConfig(
@@ -52,39 +55,65 @@ def prepare_model():
         lora_alpha=32,
         lora_dropout=0.05,
         bias="none",
-        task_type="CAUSAL_LM"
+        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]  # All linear layers
     )
 
     model = get_peft_model(model, lora_config)
     return model, tokenizer
 
 
-def tokenize_function(examples, tokenizer):
-    prompts = [format_prompt(dict(zip(examples.keys(), ex))) for ex in zip(*examples.values())]
-    responses = examples['output']
+def tokenize_function(examples, tokenizer, max_length=512):
+    """
+    Properly tokenizes instruction-following data for Llama 3
+    Handles both cases: with and without input context
+    """
+    # Initialize lists to store processed data
+    full_texts = []
+    prompt_lengths = []
 
-    # Tokenize inputs
+    # Process each example in the batch
+    for instruction, input_text, output in zip(examples['instruction'],
+                                               examples['input'],
+                                               examples['output']):
+        prompt = format_prompt({'instruction': instruction, 'input': input_text, 'output': output})
+
+        # Combine prompt with response
+        full_text = prompt + f"Response: {output}<|eot_id|>"
+        full_texts.append(full_text)
+
+        # Tokenize just the prompt to get its length
+        prompt_tokenized = tokenizer(
+            prompt,
+            truncation=False,
+            add_special_tokens=False  # Don't add extra special tokens
+        )
+        prompt_lengths.append(len(prompt_tokenized['input_ids']))
+
+    # Tokenize all full texts (prompt + response)
     tokenized_inputs = tokenizer(
-        prompts,
+        full_texts,
+        padding="max_length",
         truncation=True,
-        max_length=512,
-        padding="max_length"
+        max_length=max_length,
+        return_tensors="pt"
     )
 
-    # Tokenize outputs
-    tokenized_outputs = tokenizer(
-        responses,
-        truncation=True,
-        max_length=512,
-        padding="max_length"
-    )
+    # Create labels by masking the prompt part
+    labels = tokenized_inputs['input_ids'].clone()
+    for i, prompt_len in enumerate(prompt_lengths):
+        # Only calculate loss on the response part
+        labels[i, :prompt_len] = -100
 
-    return {
-        "input_ids": tokenized_inputs["input_ids"],
-        "attention_mask": tokenized_inputs["attention_mask"],
-        "labels": tokenized_outputs["input_ids"]
-    }
+        # Also ensure we don't calculate loss on padding tokens
+        # Find the first pad token (if any)
+        pad_mask = (tokenized_inputs['input_ids'][i] == tokenizer.pad_token_id)
+        if pad_mask.any():
+            first_pad = pad_mask.nonzero()[0].item()
+            labels[i, first_pad:] = -100
 
+    tokenized_inputs['labels'] = labels
+    return tokenized_inputs
 
 def compute_metrics(eval_preds, tokenizer):
     rouge = evaluate.load("rouge")
@@ -115,19 +144,20 @@ def main():
     tokenized_train = train_data.map(
         lambda x: tokenize_function(x, tokenizer),
         batched=True,
-        batch_size=True,
+        batch_size=2,
         remove_columns=train_data.column_names
     )
-    tokenized_eval = eval_data.map(
-        lambda x: tokenize_function(x, tokenizer),
-        batched=True,
-        remove_columns=eval_data.column_names
-    )
+    # tokenized_eval = eval_data.map(
+    #     lambda x: tokenize_function(x, tokenizer),
+    #     batched=True,
+    #     remove_columns=eval_data.column_names,
+    #     batch_size = 4,
+    # )
 
     data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
-    # data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    # data_collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
 
-    train_dataloader = DataLoader(tokenized_train, shuffle=True, batch_size=2, collate_fn=data_collator)
+    train_dataloader = DataLoader(tokenized_train, shuffle=True, batch_size=2, collate_fn=data_collator, drop_last=True)
 
     num_epochs = 3
     total_loss = 0.0
@@ -153,16 +183,25 @@ def main():
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-            # progress_bar.update(1)
+            progress_bar.update(1)
+            progress_bar.set_description(f"Loss: {loss.item():.4f}")
             # Update progress bar description with the current average loss
             num_steps += 1
-            progress_bar.set_postfix(loss=total_loss / num_steps)
+            # progress_bar.set_postfix(loss=total_loss / num_steps)
 
         # Optionally, print out the average loss after training
         average_loss = total_loss / num_steps
         print(f"Epoch {epoch + 1} completed. Avg loss: {average_loss:.4f}\n")
 
-
+    # # Save model and tokenizer
+    # Save only LoRA adapters (not full model)
+    model.save_pretrained(
+        "./lora_adapters",
+        safe_serialization=True,
+        save_adapter=True,  # Explicit adapter-only save
+        save_config=True
+    )
+    tokenizer.save_pretrained("./lora_adapters")
 
 
 
