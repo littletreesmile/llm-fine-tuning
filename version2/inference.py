@@ -1,4 +1,14 @@
-###
+'''
+The inference includes both with and without Trainer. The only change needs to
+take care is below. Choose the corresponding model and tokenizer.
+
+# Load fine-tuning model and tokenizer
+# model, tokenizer = load_finetuning_model(MODEL_NAME, FINETUNING_MODEL_PATH)
+
+# Load fine-tuning model and tokenizer with Trainer
+model, tokenizer = loaded_fine_tuning_model_trainer("./finetuning_trainer")
+
+'''
 
 import torch
 from datasets import load_dataset
@@ -49,6 +59,26 @@ def load_finetuning_model(model_name, finetuning_model_path):
         return model, tokenizer
 
 
+
+def loaded_fine_tuning_model_trainer(model_path):
+    # Define 4-bit quantization config
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4"
+    )
+
+    # Load tokenizer and model
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        quantization_config=bnb_config,
+        device_map="auto"
+    )
+    return model, tokenizer
+
+
 def format_output(full_response):
     # Split into user/assistant parts
     parts = full_response.split("assistant\n\n")
@@ -70,7 +100,10 @@ FINETUNING_MODEL_PATH = "./lora_adapters"
 TEST_DATASET = "SeaEval/CRAFT-Singapore-Instruction-GPT4"  # Your test dataset
 
 # Load fine-tuning model and tokenizer
-model, tokenizer = load_finetuning_model(MODEL_NAME, FINETUNING_MODEL_PATH)
+# model, tokenizer = load_finetuning_model(MODEL_NAME, FINETUNING_MODEL_PATH)
+
+# Load fine-tuning model and tokenizer with Trainer
+model, tokenizer = loaded_fine_tuning_model_trainer("./finetuning_trainer")
 
 # Load test data
 dataset = load_dataset(TEST_DATASET)  # Small subset for testing
